@@ -1,8 +1,12 @@
 #!/bin/bash
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 echo "=== HelloWorld MCP Server 一键安装 ==="
 echo ""
+
+cd "$SCRIPT_DIR"
 
 # Check Node.js
 if ! command -v node &> /dev/null; then
@@ -29,7 +33,7 @@ echo '  {'
 echo '    "mcpServers": {'
 echo '      "helloworld": {'
 echo '        "command": "node",'
-echo '        "args": ["'"$(pwd)"'/index.js"]'
+echo '        "args": ["'"$SCRIPT_DIR"'/index.js"]'
 echo '      }'
 echo '    }'
 echo '  }'
