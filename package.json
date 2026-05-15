@@ -1,0 +1,15 @@
+{
+  "name": "helloworld-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP Server for HelloWorld跨境电商助手",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "chrome-remote-interface": "^0.34.0",
+    "zod": "^4.4.3"
+  }
+}
