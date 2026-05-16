@@ -1169,6 +1169,223 @@ server.registerTool(
   }
 );
 
+// 16. 导出 WhatsApp 聊天记录到文件
+server.registerTool(
+  "export_whatsapp_chat",
+  {
+    description:
+      "导出指定 WhatsApp 联系人的全部聊天记录到文件。按联系人号码模糊匹配聊天，读取全部消息，格式化为文本文件保存到桌面。",
+    inputSchema: {
+      contact_number: z
+        .string()
+        .describe("联系人号码，模糊匹配。如 '7608675' 匹配 +1 (570) 760-8675"),
+      output_dir: z
+        .string()
+        .optional()
+        .describe("输出目录，默认桌面"),
+      port: z
+        .number()
+        .optional()
+        .default(9222)
+        .describe("CDP 调试端口，默认 9222"),
+    },
+  },
+  async ({ contact_number, output_dir, port }) => {
+    if (!(await checkCdpAvailable(port))) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              error: `CDP 端口 ${port} 不可用。`,
+              remediation:
+                "请先用 'launch_app_with_debug' 工具以调试模式重启应用。",
+            }),
+          },
+        ],
+      };
+    }
+    const targets = await findWhatsAppTarget(port);
+    if (targets.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              error: "未找到 WhatsApp webview。请在 HelloWorld 中打开 WhatsApp 面板。",
+            }),
+          },
+        ],
+      };
+    }
+
+    const outputPath = output_dir || join(HOME, "Desktop");
+
+    // Step 1: Find contact, open chat, read messages via CDP
+    const findExpression = `
+(async () => {
+  const num = '${contact_number.replace(/'/g, "\\'")}';
+  try {
+    if (typeof Store === 'undefined' || !Store.Contact) {
+      return JSON.stringify({ error: 'WhatsApp Store 尚未加载，请等待几秒后重试。' });
+    }
+
+    // Search Store.Contact for matching number
+    const contacts = Store.Contact.getModelsArray();
+    const match = contacts.find(c => {
+      const id = (c.id?._serialized || c.id || '').replace(/[@c.us@g.us]/g, '');
+      const clean = id.replace(/[+\\s()-]/g, '');
+      return clean.includes(num);
+    });
+
+    if (!match) {
+      const sampleIds = contacts.slice(0, 10).map(c => c.id?._serialized || c.id || '');
+      return JSON.stringify({ error: '未找到匹配联系人: ' + num, total_contacts: contacts.length, sample_ids: sampleIds });
+    }
+
+    const chatId = match.id?._serialized || match.id;
+    const chatName = match.name || match.formattedName || match.pushname || '';
+
+    // Open chat window to trigger message loading
+    if (typeof window.openChatWindow === 'function') {
+      await window.openChatWindow(chatId);
+    }
+
+    // Wait for messages to load (async)
+    await new Promise(r => setTimeout(r, 2000));
+
+    // Read messages from Store.Msg (reliable, covers unloaded chats)
+    let messages = [];
+    if (Store.Msg) {
+      const allMsgs = Store.Msg.getModelsArray();
+      const chatMsgs = allMsgs.filter(m => {
+        const from = m.from?._serialized || m.from || '';
+        const to = m.to?._serialized || m.to || '';
+        return from === chatId || to === chatId;
+      });
+      chatMsgs.sort((a, b) => (a.t || 0) - (b.t || 0));
+      messages = chatMsgs.map(m => ({
+        id: m.id?._serialized || m.id,
+        body: m.body || '',
+        type: m.type || 'text',
+        from: m.from?._serialized || m.from || '',
+        timestamp: m.t,
+        hasMedia: !!(m.mediaData || m.deprecatedMms3Url || m.mmUrl),
+        isFromMe: !!(m.id?.fromMe || m.fromMe),
+      }));
+    } else {
+      // Fallback: try chat.msgs
+      const chat = Store.Chat.get(chatId);
+      if (chat) {
+        const msgs = chat.msgs.getModelsArray();
+        messages = msgs.map(m => ({
+          id: m.id?._serialized || m.id,
+          body: m.body || '',
+          type: m.type || 'text',
+          from: m.from?._serialized || m.author || '',
+          timestamp: m.t,
+          hasMedia: !!(m.mediaData || m.deprecatedMms3Url),
+          isFromMe: !!(m.id?.fromMe || m.fromMe),
+        }));
+      }
+    }
+
+    return JSON.stringify({ chatId, chatName, totalMessages: messages.length, messages });
+  } catch(e) {
+    return JSON.stringify({ error: e.message });
+  }
+})()
+`;
+
+    try {
+      const result = await executeInWebView(targets[0].id, findExpression, port);
+      let data;
+      try {
+        data = JSON.parse(result.result.value);
+      } catch {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                error: "解析 CDP 返回数据失败。",
+                raw: String(result.result.value).substring(0, 500),
+              }),
+            },
+          ],
+        };
+      }
+
+      if (data.error) {
+        return {
+          content: [
+            { type: "text", text: JSON.stringify(data, null, 2) },
+          ],
+        };
+      }
+
+      // Step 2: Format and write to file
+      const lines = [];
+      lines.push(`=== ${data.chatName} (${data.chatId}) 聊天记录 ===`);
+      lines.push(`导出时间: ${new Date().toLocaleString("zh-CN")}`);
+      lines.push(`消息总数: ${data.totalMessages}`);
+      lines.push("");
+
+      for (const m of data.messages) {
+        const time = m.timestamp
+          ? new Date(m.timestamp * 1000).toLocaleString("zh-CN")
+          : "未知时间";
+        const sender = m.isFromMe ? "我" : data.chatName;
+        lines.push(`${time}  ${sender}`);
+        if (m.body) lines.push(m.body);
+        if (m.hasMedia) lines.push("[媒体/附件]");
+        if (m.type && m.type !== "text") lines.push(`[类型: ${m.type}]`);
+        lines.push("");
+      }
+
+      const safeName = data.chatName.replace(/[/\\:*?"<>|]/g, "_");
+      const fileName = `${safeName}-聊天记录.txt`;
+      const filePath = join(outputPath, fileName);
+      writeFileSync(filePath, lines.join("\n"), "utf-8");
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                success: true,
+                file_path: filePath,
+                file_name: fileName,
+                chat_id: data.chatId,
+                chat_name: data.chatName,
+                total_messages: data.totalMessages,
+                first_message_time: data.messages.length > 0
+                  ? new Date(data.messages[0].timestamp * 1000).toLocaleString("zh-CN")
+                  : null,
+                last_message_time: data.messages.length > 0
+                  ? new Date(data.messages[data.messages.length - 1].timestamp * 1000).toLocaleString("zh-CN")
+                  : null,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (e) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ error: "导出失败。", detail: e.message }),
+          },
+        ],
+      };
+    }
+  }
+);
+
 // ---- start ----
 
 async function main() {
