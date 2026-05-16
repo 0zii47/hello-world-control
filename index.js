@@ -1324,22 +1324,37 @@ server.registerTool(
         };
       }
 
-      // Step 2: Format and write to file
+      // Step 2: Format and write to file (grouped by date)
       const lines = [];
       lines.push(`=== ${data.chatName} (${data.chatId}) 聊天记录 ===`);
       lines.push(`导出时间: ${new Date().toLocaleString("zh-CN")}`);
       lines.push(`消息总数: ${data.totalMessages}`);
       lines.push("");
 
+      let lastDate = "";
       for (const m of data.messages) {
-        const time = m.timestamp
-          ? new Date(m.timestamp * 1000).toLocaleString("zh-CN")
-          : "未知时间";
+        const dt = m.timestamp ? new Date(m.timestamp * 1000) : null;
+        const dateStr = dt ? dt.toLocaleDateString("zh-CN", { year: "numeric", month: "long", day: "numeric" }) : "未知日期";
+        const timeStr = dt ? dt.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }) : "未知时间";
+
+        // Date group separator
+        if (dateStr !== lastDate) {
+          lastDate = dateStr;
+          lines.push(`--- ${dateStr} ---`);
+        }
+
         const sender = m.isFromMe ? "我" : data.chatName;
-        lines.push(`${time}  ${sender}`);
-        if (m.body) lines.push(m.body);
+        lines.push(`${timeStr}  ${sender}`);
+
+        const isBase64Media = m.body && (
+          m.body.startsWith("/9j/") || m.body.startsWith("iVBOR") ||
+          m.body.startsWith("AAAB") || m.body.length > 5000
+        );
+        if (m.body && !isBase64Media) {
+          lines.push(m.body);
+        }
         if (m.hasMedia) lines.push("[媒体/附件]");
-        if (m.type && m.type !== "text") lines.push(`[类型: ${m.type}]`);
+        if (m.type && m.type !== "text" && m.type !== "chat") lines.push(`[类型: ${m.type}]`);
         lines.push("");
       }
 
