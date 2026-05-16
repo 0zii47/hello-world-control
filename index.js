@@ -2,21 +2,30 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod/v4";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
-import { execSync } from "node:child_process";
-import { join, dirname } from "node:path";
+import { exec } from "node:child_process";
+import { promisify } from "node:util";
+import { join, dirname, resolve } from "node:path";
 import { homedir } from "node:os";
 import {
   findWhatsAppTarget,
   executeInWebView,
   checkCdpAvailable,
 } from "./cdp-client.js";
+import { ensureWhatsAppTarget, makeResult, makeError, safeJs } from "./cdp-helpers.js";
+import { getChatsExpression } from "./cdp-scripts/get-chats.js";
+import { getMessagesExpression } from "./cdp-scripts/get-messages.js";
+import { getContactsExpression } from "./cdp-scripts/get-contacts.js";
+import { getUnreadExpression } from "./cdp-scripts/get-unread.js";
+import { exportChatExpression } from "./cdp-scripts/export-chat.js";
 
+const execAsync = promisify(exec);
 const HOME = homedir();
 const APP_NAME = "HelloWorld跨境电商助手";
 const APP_PATH = `/Applications/${APP_NAME}.app`;
 const DATA_DIR = join(HOME, "Library/Application Support", APP_NAME);
 const CONFIG_PATH = join(DATA_DIR, "config");
 const FRIENDS_CACHE_PATH = join(DATA_DIR, "Friends Cache");
+const DESKTOP = join(HOME, "Desktop");
 
 // ---- helpers ----
 
@@ -30,31 +39,30 @@ function writeConfig(config) {
   writeFileSync(CONFIG_PATH, JSON.stringify(config, null, "\t"));
 }
 
-function getAppProcess() {
+async function getAppProcess() {
   try {
-    const out = execSync(`pgrep -fl "${APP_NAME}"`, { encoding: "utf-8", timeout: 3000 });
-    const lines = out.trim().split("\n").filter(Boolean);
-    const processes = [];
-    for (const line of lines) {
+    const { stdout } = await execAsync(`pgrep -fl "${APP_NAME}"`, { timeout: 3000 });
+    const lines = stdout.trim().split("\n").filter(Boolean);
+    return lines.map((line) => {
       const [pid, ...rest] = line.split(" ");
-      processes.push({ pid: parseInt(pid), command: rest.join(" ") });
-    }
-    return processes;
+      return { pid: parseInt(pid), command: rest.join(" ") };
+    });
   } catch {
     return [];
   }
 }
 
-function getListeningPorts() {
+async function getListeningPorts() {
   try {
-    const pids = getAppProcess().map((p) => p.pid);
-    if (pids.length === 0) return [];
-    const out = execSync(
+    const procs = await getAppProcess();
+    if (procs.length === 0) return [];
+    const pids = procs.map((p) => p.pid);
+    const { stdout } = await execAsync(
       `lsof -i -P -n 2>/dev/null | grep -E "${pids.join("|")}" | grep LISTEN`,
-      { encoding: "utf-8", timeout: 3000 }
+      { timeout: 3000 }
     );
     const ports = [];
-    for (const line of out.trim().split("\n")) {
+    for (const line of stdout.trim().split("\n")) {
       const m = line.match(/:(\d+) \(LISTEN\)/);
       if (m) ports.push(parseInt(m[1]));
     }
@@ -64,13 +72,18 @@ function getListeningPorts() {
   }
 }
 
+/**
+ * 验证输出路径在允许范围内（桌面或其子目录）。
+ */
+function isSafeOutputPath(dir) {
+  const resolved = resolve(dir);
+  return resolved === DESKTOP || resolved.startsWith(DESKTOP + "/");
+}
+
 // ---- server ----
 
 const server = new McpServer(
-  {
-    name: "helloworld-mcp-server",
-    version: "1.0.0",
-  },
+  { name: "helloworld-mcp-server", version: "1.1.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -85,23 +98,9 @@ server.registerTool(
   async () => {
     const config = readConfig();
     if (!config) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ error: "未找到配置文件，应用可能尚未运行过。" }),
-          },
-        ],
-      };
+      return makeError("未找到配置文件，应用可能尚未运行过。");
     }
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(config, null, 2),
-        },
-      ],
-    };
+    return makeResult(config);
   }
 );
 
@@ -110,7 +109,7 @@ server.registerTool(
   "update_config",
   {
     description:
-      "更新 HelloWorld 应用配置。可修改的设置包括：窗口置顶 (always_on_top)、自动启动 (auto_launch)、代理设置 (proxy, proxyHost, proxyPort)、语言 (locale)、干扰模式 (dont_disturb) 等。",
+      "更新 HelloWorld 应用配置。可修改的设置包括：窗口置顶、自动启动、代理设置、语言、干扰模式等。",
     inputSchema: {
       always_on_top: z.boolean().optional().describe("始终置顶窗口"),
       hide_menu_bar: z.boolean().optional().describe("隐藏菜单栏"),
@@ -133,25 +132,11 @@ server.registerTool(
   async (updates) => {
     const config = readConfig();
     if (!config) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ error: "配置文件不存在，无法更新。请先运行应用。" }),
-          },
-        ],
-      };
+      return makeError("配置文件不存在，无法更新。请先运行应用。");
     }
     Object.assign(config, updates);
     writeConfig(config);
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify({ success: true, config }, null, 2),
-        },
-      ],
-    };
+    return makeResult({ success: true, config });
   }
 );
 
@@ -164,11 +149,10 @@ server.registerTool(
     inputSchema: {},
   },
   async () => {
-    const processes = getAppProcess();
-    const ports = getListeningPorts();
+    const processes = await getAppProcess();
+    const ports = await getListeningPorts();
     const config = readConfig();
-
-    const status = {
+    return makeResult({
       running: processes.length > 0,
       processes,
       listening_ports: ports,
@@ -177,13 +161,7 @@ server.registerTool(
       config_summary: config
         ? { locale: config.locale, proxy: config.proxy, auto_launch: config.auto_launch, version: config.version }
         : null,
-    };
-
-    return {
-      content: [
-        { type: "text", text: JSON.stringify(status, null, 2) },
-      ],
-    };
+    });
   }
 );
 
@@ -195,36 +173,15 @@ server.registerTool(
     inputSchema: {},
   },
   async () => {
-    const processes = getAppProcess();
+    const processes = await getAppProcess();
     if (processes.length > 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              message: "应用已在运行中。",
-              processes,
-            }),
-          },
-        ],
-      };
+      return makeResult({ message: "应用已在运行中。", processes });
     }
     try {
-      execSync(`open "${APP_PATH}"`, { timeout: 5000 });
-      return {
-        content: [
-          { type: "text", text: JSON.stringify({ success: true, message: "应用已启动。" }) },
-        ],
-      };
+      await execAsync(`open "${APP_PATH}"`, { timeout: 5000 });
+      return makeResult({ success: true, message: "应用已启动。" });
     } catch (e) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ error: "无法启动应用。", detail: e.message }),
-          },
-        ],
-      };
+      return makeError("无法启动应用。", e.message);
     }
   }
 );
@@ -237,38 +194,17 @@ server.registerTool(
     inputSchema: {},
   },
   async () => {
-    const processes = getAppProcess();
+    const processes = await getAppProcess();
     if (processes.length === 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ message: "应用未在运行。" }),
-          },
-        ],
-      };
+      return makeResult({ message: "应用未在运行。" });
     }
     try {
       for (const p of processes) {
-        execSync(`kill ${p.pid}`, { timeout: 3000 });
+        await execAsync(`kill ${p.pid}`, { timeout: 3000 });
       }
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ success: true, message: `已退出 ${processes.length} 个进程。` }),
-          },
-        ],
-      };
+      return makeResult({ success: true, message: `已退出 ${processes.length} 个进程。` });
     } catch (e) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ error: "退出应用时出错。", detail: e.message }),
-          },
-        ],
-      };
+      return makeError("退出应用时出错。", e.message);
     }
   }
 );
@@ -282,21 +218,10 @@ server.registerTool(
   },
   async () => {
     if (!existsSync(FRIENDS_CACHE_PATH)) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ message: "暂无好友缓存数据。" }),
-          },
-        ],
-      };
+      return makeResult({ message: "暂无好友缓存数据。" });
     }
     const data = JSON.parse(readFileSync(FRIENDS_CACHE_PATH, "utf-8"));
-    return {
-      content: [
-        { type: "text", text: JSON.stringify(data, null, 2) },
-      ],
-    };
+    return makeResult(data);
   }
 );
 
@@ -319,24 +244,12 @@ server.registerTool(
       const url = `https://cdn.helloword.com.cn/language/${provider}.json`;
       const resp = await fetch(url, { signal: AbortSignal.timeout(5000) });
       if (!resp.ok) {
-        return {
-          content: [
-            { type: "text", text: JSON.stringify({ error: `无法获取 ${provider} 语言配置。HTTP ${resp.status}` }) },
-          ],
-        };
+        return makeError(`无法获取 ${provider} 语言配置。HTTP ${resp.status}`);
       }
       const data = await resp.json();
-      return {
-        content: [
-          { type: "text", text: JSON.stringify({ provider, languages: data }, null, 2) },
-        ],
-      };
+      return makeResult({ provider, languages: data });
     } catch (e) {
-      return {
-        content: [
-          { type: "text", text: JSON.stringify({ error: e.message }) },
-        ],
-      };
+      return makeError(e.message);
     }
   }
 );
@@ -351,57 +264,25 @@ server.registerTool(
   },
   async () => {
     try {
-      const url =
-        "https://s3.client.update.helloworldtranslate.com/update/store/all.json";
+      const url = "https://s3.client.update.helloworldtranslate.com/update/store/all.json";
       const resp = await fetch(url, { signal: AbortSignal.timeout(5000) });
-      if (!resp.ok) {
-        // fallback: read local store
-        const localStore = join(
-          "/tmp/helloworld_extract/store/all.json"
-        );
-        if (existsSync(localStore)) {
-          const data = JSON.parse(readFileSync(localStore, "utf-8"));
-          const platforms = data.map((p) => ({
-            id: p.id,
-            name: p.name,
-            url: p.url,
-            type: p.type,
-            version: p.version,
-          }));
-          return {
-            content: [
-              { type: "text", text: JSON.stringify({ platforms, source: "local" }, null, 2) },
-            ],
-          };
+      const source = resp.ok ? "remote" : "local";
+      let data;
+      if (resp.ok) {
+        data = await resp.json();
+      } else {
+        const localStore = join("/tmp/helloworld_extract/store/all.json");
+        if (!existsSync(localStore)) {
+          return makeError("无法获取平台列表。");
         }
-        return {
-          content: [
-            { type: "text", text: JSON.stringify({ error: "无法获取平台列表。" }) },
-          ],
-        };
+        data = JSON.parse(readFileSync(localStore, "utf-8"));
       }
-      const data = await resp.json();
       const platforms = data.map((p) => ({
-        id: p.id,
-        name: p.name,
-        url: p.url,
-        type: p.type,
-        version: p.version,
+        id: p.id, name: p.name, url: p.url, type: p.type, version: p.version,
       }));
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ platforms, source: "remote" }, null, 2),
-          },
-        ],
-      };
+      return makeResult({ platforms, source });
     } catch (e) {
-      return {
-        content: [
-          { type: "text", text: JSON.stringify({ error: e.message }) },
-        ],
-      };
+      return makeError(e.message);
     }
   }
 );
@@ -422,36 +303,18 @@ server.registerTool(
         signal: AbortSignal.timeout(5000),
       });
       const data = await resp.json();
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                reachable: true,
-                status: resp.status,
-                response: data,
-                note: "API 可达。完整功能（订单查询、联系人管理等）需要登录令牌。",
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
+      return makeResult({
+        reachable: true,
+        status: resp.status,
+        response: data,
+        note: "API 可达。完整功能（订单查询、联系人管理等）需要登录令牌。",
+      });
     } catch (e) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              reachable: false,
-              error: e.message,
-              note: "远程 API 不可达。请检查网络连接。",
-            }),
-          },
-        ],
-      };
+      return makeResult({
+        reachable: false,
+        error: e.message,
+        note: "远程 API 不可达。请检查网络连接。",
+      });
     }
   }
 );
@@ -476,56 +339,41 @@ server.registerTool(
       "Partitions/helloworld_index/Local Storage/leveldb"
     );
     if (!existsSync(leveldbPath)) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ error: "LevelDB 数据目录不存在。" }),
-          },
-        ],
-      };
+      return makeError("LevelDB 数据目录不存在。");
     }
     try {
-      const script = `
-import sys
-sys.path.insert(0, '${join(HOME, "Library/Python/3.9/lib/python/site-packages")}')
-try:
-    import plyvel
-    db = plyvel.DB('${leveldbPath}', create_if_missing=False)
-    keys = []
-    for key, value in db:
-        key_str = key.decode('utf-8', errors='replace')
-        if '${format}' == 'raw':
-            val_str = value.decode('utf-8', errors='replace')[:500]
-            keys.append({'key': key_str, 'value_preview': val_str})
-        else:
-            keys.append(key_str)
-    db.close()
-    print(json.dumps({'found': len(keys), 'keys': keys}))
-except ImportError:
-    print(json.dumps({'error': 'plyvel 未安装。请运行: pip3 install plyvel'}))
-except Exception as e:
-    print(json.dumps({'error': str(e)}))
-`;
-      const result = execSync(`python3 -c "${script.replace(/"/g, '\\"')}"`, {
-        encoding: "utf-8",
-        timeout: 5000,
-      });
-      const data = JSON.parse(result.trim());
-      return {
-        content: [
-          { type: "text", text: JSON.stringify(data, null, 2) },
-        ],
-      };
+      // 动态获取 Python site-packages 路径，避免硬编码 3.9
+      const { stdout: sitePath } = await execAsync(
+        `python3 -c "import site; print(site.getsitepackages()[0])"`,
+        { timeout: 3000 }
+      );
+      const pkgPath = sitePath.trim();
+      const script = [
+        "import sys",
+        `sys.path.insert(0, ${safeJs(pkgPath)})`,
+        "try:",
+        "    import plyvel",
+        `    db = plyvel.DB(${safeJs(leveldbPath)}, create_if_missing=False)`,
+        "    keys = []",
+        "    for key, value in db:",
+        "        key_str = key.decode('utf-8', errors='replace')",
+        `        if ${safeJs(format)} == 'raw':`,
+        "            val_str = value.decode('utf-8', errors='replace')[:500]",
+        "            keys.append({'key': key_str, 'value_preview': val_str})",
+        "        else:",
+        "            keys.append(key_str)",
+        "    db.close()",
+        "    print(json.dumps({'found': len(keys), 'keys': keys}))",
+        "except ImportError:",
+        "    print(json.dumps({'error': 'plyvel 未安装。请运行: pip3 install plyvel'}))",
+        "except Exception as e:",
+        "    print(json.dumps({'error': str(e)}))",
+      ].join("\n");
+      const { stdout } = await execAsync(`python3 -c ${safeJs(script)}`, { timeout: 5000 });
+      const data = JSON.parse(stdout.trim());
+      return makeResult(data);
     } catch (e) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ error: "读取 LevelDB 失败。", detail: e.message }),
-          },
-        ],
-      };
+      return makeError("读取 LevelDB 失败。", e.message);
     }
   }
 );
@@ -539,67 +387,35 @@ server.registerTool(
     description:
       "以 Chrome DevTools Protocol 模式启动 HelloWorld 应用（用于读取 WhatsApp 消息等高级操作）。启动前会自动退出当前运行的实例。",
     inputSchema: {
-      port: z
-        .number()
-        .optional()
-        .default(9222)
-        .describe("CDP 调试端口，默认 9222"),
+      port: z.number().optional().default(9222).describe("CDP 调试端口，默认 9222"),
     },
   },
   async ({ port }) => {
-    // First quit existing instances
-    const processes = getAppProcess();
+    const processes = await getAppProcess();
     if (processes.length > 0) {
       for (const p of processes) {
-        try {
-          execSync(`kill ${p.pid}`, { timeout: 3000 });
-        } catch {}
+        try { await execAsync(`kill ${p.pid}`, { timeout: 3000 }); } catch {}
       }
-      // Wait for shutdown
       await new Promise((r) => setTimeout(r, 2000));
     }
     try {
-      execSync(`open -n "${APP_PATH}" --args --remote-debugging-port=${port}`, {
-        timeout: 5000,
-      });
-      // Wait for CDP to become available
+      await execAsync(`open -n "${APP_PATH}" --args --remote-debugging-port=${port}`, { timeout: 5000 });
       for (let i = 0; i < 15; i++) {
         await new Promise((r) => setTimeout(r, 1000));
         if (await checkCdpAvailable(port)) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: JSON.stringify({
-                  success: true,
-                  message: `应用已以 CDP 模式启动，端口 ${port}`,
-                  cdp_url: `http://localhost:${port}/json`,
-                }),
-              },
-            ],
-          };
+          return makeResult({
+            success: true,
+            message: `应用已以 CDP 模式启动，端口 ${port}`,
+            cdp_url: `http://localhost:${port}/json`,
+          });
         }
       }
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              success: true,
-              message: `应用已启动，但 CDP 端口 ${port} 尚未就绪。请等待 WhatsApp 加载完成后重试。`,
-            }),
-          },
-        ],
-      };
+      return makeResult({
+        success: true,
+        message: `应用已启动，但 CDP 端口 ${port} 尚未就绪。请等待 WhatsApp 加载完成后重试。`,
+      });
     } catch (e) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ error: "启动应用失败。", detail: e.message }),
-          },
-        ],
-      };
+      return makeError("启动应用失败。", e.message);
     }
   }
 );
@@ -611,142 +427,30 @@ server.registerTool(
     description:
       "获取 HelloWorld 中 WhatsApp 的所有聊天列表，包括未读数、最后消息预览等。需要先使用 launch_app_with_debug 以 CDP 模式启动应用。",
     inputSchema: {
-      port: z
-        .number()
-        .optional()
-        .default(9222)
-        .describe("CDP 调试端口，默认 9222"),
-      include_unread_only: z
-        .boolean()
-        .optional()
-        .default(false)
-        .describe("只返回有未读消息的聊天"),
+      port: z.number().optional().default(9222).describe("CDP 调试端口，默认 9222"),
+      include_unread_only: z.boolean().optional().default(false).describe("只返回有未读消息的聊天"),
     },
   },
   async ({ port, include_unread_only }) => {
-    if (!(await checkCdpAvailable(port))) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              error: `CDP 端口 ${port} 不可用。`,
-              remediation:
-                "请先用 'launch_app_with_debug' 工具以调试模式重启应用，或手动启动: open -n /Applications/HelloWorld跨境电商助手.app --args --remote-debugging-port=9222",
-            }),
-          },
-        ],
-      };
-    }
-    const targets = await findWhatsAppTarget(port);
-    if (targets.length === 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              error: "未找到 WhatsApp webview。请在 HelloWorld 中打开 WhatsApp 面板。",
-              available_targets: `请检查 http://localhost:${port}/json 查看所有可调试页面。`,
-            }),
-          },
-        ],
-      };
-    }
+    const { target, errorResponse } = await ensureWhatsAppTarget(port);
+    if (errorResponse) return errorResponse;
 
-    const expression = `
-(async () => {
-  try {
-    // Primary: WhatsApp Store API (always available once WhatsApp loads)
-    if (typeof Store !== 'undefined' && Store.Chat) {
-      const chats = Store.Chat.getModelsArray();
-      const result = [];
-      for (const c of chats) {
-        if (!c.id) continue;
-        // Load last message body from msgs collection
-        let lastMsgBody = null;
-        let lastMsgTime = c.t || null;
-        try {
-          const msgs = c.msgs.getModelsArray();
-          if (msgs.length > 0) {
-            const lm = msgs[msgs.length - 1];
-            lastMsgBody = lm.body?.substring(0, 300) || null;
-            lastMsgTime = lm.t || lastMsgTime;
-          }
-        } catch {}
-        result.push({
-          id: c.id._serialized || c.id,
-          name: c.name || c.formattedTitle || '(unknown)',
-          unreadCount: c.unreadCount || 0,
-          isGroup: c.isGroup || false,
-          isMuted: c.muteExpiration > 0,
-          lastMessage: lastMsgBody,
-          timestamp: lastMsgTime,
-        });
-      }
-      // Sort by timestamp descending
-      result.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-      return result;
-    }
-
-    // Fallback: WAPLUS_WPP
-    if (window.WAPLUS_WPP && window.WAPLUS_WPP.chat) {
-      const chats = await window.WAPLUS_WPP.chat.list();
-      return chats.map(c => {
-        const id = typeof c.id === 'object' ? c.id._serialized : c.id;
-        return {
-          id, name: c.name || c.formattedTitle || '(unknown)',
-          unreadCount: c.unreadCount || 0,
-          isGroup: c.isGroup || false,
-          isMuted: c.muteExpiration > 0,
-          lastMessage: c.lastMessage?.body?.substring(0, 300) || null,
-          timestamp: c.timestamp || c.lastMessage?.timestamp || null,
-        };
-      });
-    }
-
-    return { error: 'WhatsApp 尚未加载。请等待几秒后重试。' };
-  } catch(e) {
-    return { error: e.message };
-  }
-})()
-`;
-
+    const expression = getChatsExpression({ include_unread_only });
     try {
-      const result = await executeInWebView(targets[0].id, expression, port);
+      const result = await executeInWebView(target.id, expression, port);
       let data;
       try {
         data = JSON.parse(result.result.value);
       } catch {
         data = result.result.value;
       }
-      if (include_unread_only && Array.isArray(data)) {
-        data = data.filter((c) => c.unreadCount > 0);
-      }
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                total_chats: Array.isArray(data) ? data.length : 0,
-                whatsapp_target: targets[0].url,
-                chats: data,
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
+      return makeResult({
+        total_chats: Array.isArray(data) ? data.length : 0,
+        whatsapp_target: target.url,
+        chats: data,
+      });
     } catch (e) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ error: "CDP 执行失败。", detail: e.message }),
-          },
-        ],
-      };
+      return makeError("CDP 执行失败。", e.message);
     }
   }
 );
@@ -758,131 +462,31 @@ server.registerTool(
     description:
       "读取指定 WhatsApp 聊天的消息内容。需要先用 launch_app_with_debug 启动应用。返回消息正文、发送者、时间戳、媒体信息等。",
     inputSchema: {
-      chat_id: z
-        .string()
-        .describe("WhatsApp 聊天 ID，例如 861234567890@c.us"),
-      count: z
-        .number()
-        .optional()
-        .default(30)
-        .describe("读取最近多少条消息，默认 30"),
-      port: z
-        .number()
-        .optional()
-        .default(9222)
-        .describe("CDP 调试端口，默认 9222"),
+      chat_id: z.string().describe("WhatsApp 聊天 ID，例如 861234567890@c.us"),
+      count: z.number().optional().default(30).describe("读取最近多少条消息，默认 30"),
+      port: z.number().optional().default(9222).describe("CDP 调试端口，默认 9222"),
     },
   },
   async ({ chat_id, count, port }) => {
-    if (!(await checkCdpAvailable(port))) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              error: `CDP 端口 ${port} 不可用。`,
-              remediation:
-                "请先用 'launch_app_with_debug' 工具以调试模式重启应用。",
-            }),
-          },
-        ],
-      };
-    }
-    const targets = await findWhatsAppTarget(port);
-    if (targets.length === 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              error: "未找到 WhatsApp webview。请在 HelloWorld 中打开 WhatsApp 面板。",
-            }),
-          },
-        ],
-      };
-    }
+    const { target, errorResponse } = await ensureWhatsAppTarget(port);
+    if (errorResponse) return errorResponse;
 
-    const expression = `
-(async () => {
-  const chatId = '${chat_id.replace(/'/g, "\\'")}';
-  const count = ${count};
-
-  try {
-    // Primary: WhatsApp Store API
-    if (typeof Store !== 'undefined' && Store.Chat) {
-      const chat = Store.Chat.get(chatId);
-      if (!chat) return { error: '未找到聊天: ' + chatId };
-      const msgs = chat.msgs.getModelsArray();
-      const recent = msgs.slice(-count).reverse();
-      return recent.map(m => ({
-        id: m.id?._serialized || m.id,
-        body: m.body || '',
-        type: m.type || 'text',
-        from: m.from?._serialized || m.author,
-        timestamp: m.t,
-        hasMedia: !!(m.mediaData || m.deprecatedMms3Url),
-        isForwarded: !!m.isForwarded,
-        isFromMe: !!(m.id?.fromMe || m.fromMe),
-      }));
-    }
-
-    // Fallback: WAPLUS_WPP
-    if (window.WAPLUS_WPP && window.WAPLUS_WPP.chat) {
-      const messages = await window.WAPLUS_WPP.chat.getMessages(chatId, { count });
-      if (!messages || !Array.isArray(messages)) {
-        return { error: 'WAPLUS_WPP 未返回消息数组' };
-      }
-      return messages.map(m => ({
-        id: typeof m.id === 'object' ? m.id._serialized : m.id,
-        body: m.body || '', type: m.type || 'text',
-        from: typeof m.from === 'object' ? m.from._serialized : m.author,
-        timestamp: m.timestamp || m.t,
-        hasMedia: !!(m.mediaData || m.deprecatedMms3Url || m.mmUrl),
-        isForwarded: !!m.isForwarded,
-        isFromMe: !!(m.fromMe || m.isFromMe || (typeof m.id === 'object' && m.id.fromMe)),
-      }));
-    }
-
-    return { error: 'WhatsApp 尚未加载。请等待几秒后重试。' };
-  } catch(e) {
-    return { error: e.message };
-  }
-})()
-`;
-
+    const expression = getMessagesExpression({ chat_id, count });
     try {
-      const result = await executeInWebView(targets[0].id, expression, port);
+      const result = await executeInWebView(target.id, expression, port);
       let data;
       try {
         data = JSON.parse(result.result.value);
       } catch {
         data = result.result.value;
       }
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                chat_id,
-                message_count: Array.isArray(data) ? data.length : 0,
-                messages: data,
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
+      return makeResult({
+        chat_id,
+        message_count: Array.isArray(data) ? data.length : 0,
+        messages: data,
+      });
     } catch (e) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ error: "CDP 执行失败。", detail: e.message }),
-          },
-        ],
-      };
+      return makeError("CDP 执行失败。", e.message);
     }
   }
 );
@@ -894,138 +498,31 @@ server.registerTool(
     description:
       "搜索或列出 WhatsApp 联系人。需要先用 launch_app_with_debug 启动应用。",
     inputSchema: {
-      query: z
-        .string()
-        .optional()
-        .describe("按姓名或号码搜索联系人，留空返回所有联系人"),
-      limit: z
-        .number()
-        .optional()
-        .default(100)
-        .describe("最多返回多少个联系人"),
-      port: z
-        .number()
-        .optional()
-        .default(9222)
-        .describe("CDP 调试端口，默认 9222"),
+      query: z.string().optional().describe("按姓名或号码搜索联系人，留空返回所有联系人"),
+      limit: z.number().optional().default(100).describe("最多返回多少个联系人"),
+      port: z.number().optional().default(9222).describe("CDP 调试端口，默认 9222"),
     },
   },
   async ({ query, limit, port }) => {
-    if (!(await checkCdpAvailable(port))) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              error: `CDP 端口 ${port} 不可用。`,
-              remediation:
-                "请先用 'launch_app_with_debug' 工具以调试模式重启应用。",
-            }),
-          },
-        ],
-      };
-    }
-    const targets = await findWhatsAppTarget(port);
-    if (targets.length === 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              error: "未找到 WhatsApp webview。",
-            }),
-          },
-        ],
-      };
-    }
+    const { target, errorResponse } = await ensureWhatsAppTarget(port);
+    if (errorResponse) return errorResponse;
 
-    const expression = `
-(async () => {
-  const q = '${(query || "").replace(/'/g, "\\'")}';
-  const limit = ${limit};
-
-  try {
-    // Primary: WhatsApp Store API
-    if (typeof Store !== 'undefined' && Store.Contact) {
-      const contacts = Store.Contact.getModelsArray();
-      let filtered = contacts;
-      if (q) {
-        const lower = q.toLowerCase();
-        filtered = contacts.filter(c =>
-          (c.name || c.formattedName || c.pushname || '').toLowerCase().includes(lower) ||
-          (c.number || c.userid || '').includes(q)
-        );
-      }
-      return filtered.slice(0, limit).map(c => ({
-        id: c.id?._serialized || c.id,
-        name: c.name || c.formattedName || c.pushname || '',
-        number: c.number || c.userid || '',
-        isBusiness: c.isBusiness || false,
-        isMe: c.isMe || false,
-        isBlocked: c.isBlocked || false,
-      }));
-    }
-
-    // Fallback: WAPLUS_WPP
-    if (window.WAPLUS_WPP && window.WAPLUS_WPP.contact) {
-      let contacts;
-      if (q) {
-        contacts = await window.WAPLUS_WPP.contact.get(q);
-        contacts = contacts ? [contacts] : [];
-      } else {
-        contacts = await window.WAPLUS_WPP.contact.list();
-      }
-      if (!contacts) return [];
-      return contacts.slice(0, limit).map(c => ({
-        id: typeof c.id === 'object' ? c.id._serialized : c.id,
-        name: c.name || c.formattedName || c.pushname || '',
-        number: c.number || c.userid || '',
-        isBusiness: c.isBusiness || false,
-        isMe: c.isMe || false,
-        isBlocked: c.isBlocked || false,
-      }));
-    }
-
-    return { error: 'WhatsApp 尚未加载。请等待几秒后重试。' };
-  } catch(e) {
-    return { error: e.message };
-  }
-})()
-`;
-
+    const expression = getContactsExpression({ query, limit });
     try {
-      const result = await executeInWebView(targets[0].id, expression, port);
+      const result = await executeInWebView(target.id, expression, port);
       let data;
       try {
         data = JSON.parse(result.result.value);
       } catch {
         data = result.result.value;
       }
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                query: query || "(all)",
-                count: Array.isArray(data) ? data.length : 0,
-                contacts: data,
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
+      return makeResult({
+        query: query || "(all)",
+        count: Array.isArray(data) ? data.length : 0,
+        contacts: data,
+      });
     } catch (e) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ error: "CDP 执行失败。", detail: e.message }),
-          },
-        ],
-      };
+      return makeError("CDP 执行失败。", e.message);
     }
   }
 );
@@ -1037,134 +534,25 @@ server.registerTool(
     description:
       "获取 WhatsApp 所有未读消息的摘要：哪些聊天有新消息、消息数量和最后消息内容。需要先用 launch_app_with_debug 启动应用。",
     inputSchema: {
-      port: z
-        .number()
-        .optional()
-        .default(9222)
-        .describe("CDP 调试端口，默认 9222"),
+      port: z.number().optional().default(9222).describe("CDP 调试端口，默认 9222"),
     },
   },
   async ({ port }) => {
-    if (!(await checkCdpAvailable(port))) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              error: `CDP 端口 ${port} 不可用。`,
-              remediation:
-                "请先用 'launch_app_with_debug' 工具以调试模式重启应用。",
-            }),
-          },
-        ],
-      };
-    }
-    const targets = await findWhatsAppTarget(port);
-    if (targets.length === 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              error: "未找到 WhatsApp webview。",
-            }),
-          },
-        ],
-      };
-    }
+    const { target, errorResponse } = await ensureWhatsAppTarget(port);
+    if (errorResponse) return errorResponse;
 
-    const expression = `
-(async () => {
-  try {
-    // Primary: WhatsApp Store API
-    if (typeof Store !== 'undefined' && Store.Chat) {
-      const chats = Store.Chat.getModelsArray();
-      const unread = chats
-        .filter(c => c.unreadCount > 0)
-        .map(c => {
-          const id = c.id?._serialized || c.id;
-          // Load last message body
-          let lastMsgBody = null;
-          let lastMsgTime = c.t || null;
-          try {
-            const msgs = c.msgs.getModelsArray();
-            if (msgs.length > 0) {
-              const lm = msgs[msgs.length - 1];
-              lastMsgBody = lm.body?.substring(0, 300) || null;
-              lastMsgTime = lm.t || lastMsgTime;
-            }
-          } catch {}
-          return {
-            id, name: c.name || c.formattedTitle || '(unknown)',
-            unreadCount: c.unreadCount,
-            isGroup: c.isGroup || false,
-            isMuted: c.muteExpiration > 0,
-            lastMessage: lastMsgBody,
-            timestamp: lastMsgTime,
-          };
-        })
-        .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-
-      return {
-        total_unread_chats: unread.length,
-        total_unread_messages: unread.reduce((s, c) => s + c.unreadCount, 0),
-        unread_chats: unread,
-      };
-    }
-
-    // Fallback: WAPLUS_WPP
-    if (window.WAPLUS_WPP && window.WAPLUS_WPP.chat) {
-      const chats = await window.WAPLUS_WPP.chat.list();
-      const unread = chats
-        .filter(c => c.unreadCount > 0)
-        .map(c => {
-          const id = typeof c.id === 'object' ? c.id._serialized : c.id;
-          return {
-            id, name: c.name || c.formattedTitle || '(unknown)',
-            unreadCount: c.unreadCount,
-            isGroup: c.isGroup || false,
-            isMuted: c.muteExpiration > 0,
-            lastMessage: c.lastMessage?.body?.substring(0, 300) || null,
-            timestamp: c.lastMessage?.timestamp || null,
-          };
-        })
-        .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-      return {
-        total_unread_chats: unread.length,
-        total_unread_messages: unread.reduce((s, c) => s + c.unreadCount, 0),
-        unread_chats: unread,
-      };
-    }
-
-    return { error: 'WhatsApp 尚未加载。请等待几秒后重试。' };
-  } catch(e) {
-    return { error: e.message };
-  }
-})()
-`;
-
+    const expression = getUnreadExpression();
     try {
-      const result = await executeInWebView(targets[0].id, expression, port);
+      const result = await executeInWebView(target.id, expression, port);
       let data;
       try {
         data = JSON.parse(result.result.value);
       } catch {
         data = result.result.value;
       }
-      return {
-        content: [
-          { type: "text", text: JSON.stringify(data, null, 2) },
-        ],
-      };
+      return makeResult(data);
     } catch (e) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ error: "CDP 执行失败。", detail: e.message }),
-          },
-        ],
-      };
+      return makeError("CDP 执行失败。", e.message);
     }
   }
 );
@@ -1179,238 +567,109 @@ server.registerTool(
       contact_number: z
         .string()
         .describe("联系人号码，模糊匹配。如 '7608675' 匹配 +1 (570) 760-8675"),
-      output_dir: z
-        .string()
-        .optional()
-        .describe("输出目录，默认桌面"),
-      port: z
-        .number()
-        .optional()
-        .default(9222)
-        .describe("CDP 调试端口，默认 9222"),
+      output_dir: z.string().optional().describe("输出目录，默认桌面"),
+      port: z.number().optional().default(9222).describe("CDP 调试端口，默认 9222"),
     },
   },
   async ({ contact_number, output_dir, port }) => {
-    if (!(await checkCdpAvailable(port))) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              error: `CDP 端口 ${port} 不可用。`,
-              remediation:
-                "请先用 'launch_app_with_debug' 工具以调试模式重启应用。",
-            }),
-          },
-        ],
-      };
-    }
-    const targets = await findWhatsAppTarget(port);
-    if (targets.length === 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              error: "未找到 WhatsApp webview。请在 HelloWorld 中打开 WhatsApp 面板。",
-            }),
-          },
-        ],
-      };
+    const { target, errorResponse } = await ensureWhatsAppTarget(port);
+    if (errorResponse) return errorResponse;
+
+    const outputPath = output_dir || DESKTOP;
+    if (!isSafeOutputPath(outputPath)) {
+      return makeError("输出目录超出允许范围，仅允许桌面及其子目录。");
     }
 
-    const outputPath = output_dir || join(HOME, "Desktop");
-
-    // Step 1: Find contact, open chat, read messages via CDP
-    const findExpression = `
-(async () => {
-  const num = '${contact_number.replace(/'/g, "\\'")}';
-  try {
-    if (typeof Store === 'undefined' || !Store.Contact) {
-      return JSON.stringify({ error: 'WhatsApp Store 尚未加载，请等待几秒后重试。' });
-    }
-
-    // Search Store.Contact for matching number
-    const contacts = Store.Contact.getModelsArray();
-    const match = contacts.find(c => {
-      const id = (c.id?._serialized || c.id || '').replace(/[@c.us@g.us]/g, '');
-      const clean = id.replace(/[+\\s()-]/g, '');
-      return clean.includes(num);
-    });
-
-    if (!match) {
-      const sampleIds = contacts.slice(0, 10).map(c => c.id?._serialized || c.id || '');
-      return JSON.stringify({ error: '未找到匹配联系人: ' + num, total_contacts: contacts.length, sample_ids: sampleIds });
-    }
-
-    const chatId = match.id?._serialized || match.id;
-    const chatName = match.name || match.formattedName || match.pushname || '';
-
-    // Open chat window to trigger message loading
-    if (typeof window.openChatWindow === 'function') {
-      await window.openChatWindow(chatId);
-    }
-
-    // Wait for messages to load (async)
-    await new Promise(r => setTimeout(r, 2000));
-
-    // Read messages from Store.Msg (reliable, covers unloaded chats)
-    let messages = [];
-    if (Store.Msg) {
-      const allMsgs = Store.Msg.getModelsArray();
-      const chatMsgs = allMsgs.filter(m => {
-        const from = m.from?._serialized || m.from || '';
-        const to = m.to?._serialized || m.to || '';
-        return from === chatId || to === chatId;
-      });
-      // Note: sort is done in Node.js after parsing, more reliable
-      messages = chatMsgs.map(m => ({
-        id: m.id?._serialized || m.id,
-        body: m.body || '',
-        type: m.type || 'text',
-        from: m.from?._serialized || m.from || '',
-        timestamp: m.t,
-        hasMedia: !!(m.mediaData || m.deprecatedMms3Url || m.mmUrl),
-        isFromMe: !!(m.id?.fromMe || m.fromMe),
-      }));
-    } else {
-      // Fallback: try chat.msgs
-      const chat = Store.Chat.get(chatId);
-      if (chat) {
-        const msgs = chat.msgs.getModelsArray();
-        messages = msgs.map(m => ({
-          id: m.id?._serialized || m.id,
-          body: m.body || '',
-          type: m.type || 'text',
-          from: m.from?._serialized || m.author || '',
-          timestamp: m.t,
-          hasMedia: !!(m.mediaData || m.deprecatedMms3Url),
-          isFromMe: !!(m.id?.fromMe || m.fromMe),
-        }));
-      }
-    }
-
-    return JSON.stringify({ chatId, chatName, totalMessages: messages.length, messages });
-  } catch(e) {
-    return JSON.stringify({ error: e.message });
-  }
-})()
-`;
-
+    const expression = exportChatExpression({ contact_number });
+    let data;
     try {
-      const result = await executeInWebView(targets[0].id, findExpression, port);
-      let data;
+      const result = await executeInWebView(target.id, expression, port);
       try {
         data = JSON.parse(result.result.value);
       } catch {
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({
-                error: "解析 CDP 返回数据失败。",
-                raw: String(result.result.value).substring(0, 500),
-              }),
-            },
-          ],
-        };
+        return makeError("解析 CDP 返回数据失败。", String(result.result.value).substring(0, 500));
       }
-
-      if (data.error) {
-        return {
-          content: [
-            { type: "text", text: JSON.stringify(data, null, 2) },
-          ],
-        };
-      }
-
-      // Sort messages by timestamp (Node.js side, more reliable than in-CDP sort)
-      if (data.messages && Array.isArray(data.messages)) {
-        data.messages.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
-      }
-
-      // Step 2: Format and write to file (grouped by date)
-      const lines = [];
-      lines.push(`=== ${data.chatName} (${data.chatId}) 聊天记录 ===`);
-      lines.push(`导出时间: ${new Date().toLocaleString("zh-CN")}`);
-      lines.push(`消息总数: ${data.totalMessages}`);
-      lines.push("");
-
-      let lastDate = "";
-      for (const m of data.messages) {
-        const dt = m.timestamp ? new Date(m.timestamp * 1000) : null;
-        const dateStr = dt ? dt.toLocaleDateString("zh-CN", { year: "numeric", month: "long", day: "numeric" }) : "未知日期";
-        const timeStr = dt ? dt.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }) : "未知时间";
-
-        // Date group separator
-        if (dateStr !== lastDate) {
-          lastDate = dateStr;
-          lines.push(`--- ${dateStr} ---`);
-        }
-
-        const sender = m.isFromMe ? "我" : data.chatName;
-
-        // Map common WhatsApp message types to Chinese labels
-        const typeLabel = {
-          image: "[图片]", video: "[视频]", sticker: "[贴纸]",
-          ptt: "[语音]", audio: "[语音]", document: "[文件]",
-          revoked: "[已撤回]", gp2: "[群组通知]",
-        }[m.type] || (m.type && m.type !== "text" && m.type !== "chat" ? `[${m.type}]` : "");
-
-        // Build header line: time + sender + optional media label
-        const header = typeLabel ? `${timeStr}  ${sender}  ${typeLabel}` : `${timeStr}  ${sender}`;
-        lines.push(header);
-
-        const isBase64Media = m.body && (
-          m.body.startsWith("/9j/") || m.body.startsWith("iVBOR") ||
-          m.body.startsWith("AAAB") || m.body.length > 5000
-        );
-        if (m.body && !isBase64Media) {
-          lines.push(m.body);
-        }
-        lines.push("");
-      }
-
-      const safeName = data.chatName.replace(/[/\\:*?"<>|]/g, "_");
-      const fileName = `${safeName}-聊天记录.txt`;
-      const filePath = join(outputPath, fileName);
-      writeFileSync(filePath, lines.join("\n"), "utf-8");
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                success: true,
-                file_path: filePath,
-                file_name: fileName,
-                chat_id: data.chatId,
-                chat_name: data.chatName,
-                total_messages: data.totalMessages,
-                first_message_time: data.messages.length > 0
-                  ? new Date(data.messages[0].timestamp * 1000).toLocaleString("zh-CN")
-                  : null,
-                last_message_time: data.messages.length > 0
-                  ? new Date(data.messages[data.messages.length - 1].timestamp * 1000).toLocaleString("zh-CN")
-                  : null,
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
     } catch (e) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ error: "导出失败。", detail: e.message }),
-          },
-        ],
-      };
+      return makeError("导出失败。", e.message);
     }
+
+    if (data.error) {
+      return makeError(data.error);
+    }
+
+    // Sort messages by timestamp
+    if (data.messages && Array.isArray(data.messages)) {
+      data.messages.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+    }
+
+    // Format: header line (time + sender) then body + media on same line
+    const lines = [];
+    lines.push(`=== ${data.chatName} (${data.chatId}) 聊天记录 ===`);
+    lines.push(`导出时间: ${new Date().toLocaleString("zh-CN")}`);
+    lines.push(`消息总数: ${data.totalMessages}`);
+    lines.push("");
+
+    let lastDate = "";
+    for (const m of data.messages) {
+      const dt = m.timestamp ? new Date(m.timestamp * 1000) : null;
+      const dateStr = dt
+        ? dt.toLocaleDateString("zh-CN", { year: "numeric", month: "long", day: "numeric" })
+        : "未知日期";
+      const timeStr = dt
+        ? dt.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false })
+        : "未知时间";
+
+      if (dateStr !== lastDate) {
+        lastDate = dateStr;
+        lines.push(`--- ${dateStr} ---`);
+      }
+
+      const sender = m.isFromMe ? "我" : data.chatName;
+
+      const typeLabel = {
+        image: "[图片]", video: "[视频]", sticker: "[贴纸]",
+        ptt: "[语音]", audio: "[语音]", document: "[文件]",
+        revoked: "[已撤回]", gp2: "[群组通知]",
+      }[m.type] || (m.type && m.type !== "text" && m.type !== "chat" ? `[${m.type}]` : "");
+
+      const isBase64Media = m.body && (
+        m.body.startsWith("/9j/") || m.body.startsWith("iVBOR") ||
+        m.body.startsWith("AAAB") || m.body.length > 5000
+      );
+
+      // Header: time + sender only
+      lines.push(`${timeStr}  ${sender}`);
+
+      // Body + media on same line
+      if (m.body && !isBase64Media && typeLabel) {
+        lines.push(`${m.body}  ${typeLabel}`);
+      } else if (m.body && !isBase64Media) {
+        lines.push(m.body);
+      } else if (typeLabel) {
+        lines.push(typeLabel);
+      }
+      lines.push("");
+    }
+
+    const safeName = data.chatName.replace(/[/\\:*?"<>|]/g, "_");
+    const fileName = `${safeName}-聊天记录.txt`;
+    const filePath = join(outputPath, fileName);
+    writeFileSync(filePath, lines.join("\n"), "utf-8");
+
+    return makeResult({
+      success: true,
+      file_path: filePath,
+      file_name: fileName,
+      chat_id: data.chatId,
+      chat_name: data.chatName,
+      total_messages: data.totalMessages,
+      first_message_time: data.messages.length > 0
+        ? new Date(data.messages[0].timestamp * 1000).toLocaleString("zh-CN")
+        : null,
+      last_message_time: data.messages.length > 0
+        ? new Date(data.messages[data.messages.length - 1].timestamp * 1000).toLocaleString("zh-CN")
+        : null,
+    });
   }
 );
 
@@ -1419,8 +678,18 @@ server.registerTool(
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("HelloWorld MCP Server 已启动。");
+  console.error("HelloWorld MCP Server v1.1.0 已启动。");
 }
+
+// Graceful shutdown
+process.on("SIGINT", () => {
+  console.error("收到 SIGINT，正在关闭...");
+  process.exit(0);
+});
+process.on("SIGTERM", () => {
+  console.error("收到 SIGTERM，正在关闭...");
+  process.exit(0);
+});
 
 main().catch((err) => {
   console.error("启动失败:", err);

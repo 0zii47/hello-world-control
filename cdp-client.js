@@ -20,20 +20,29 @@ export async function findWhatsAppTarget(port = DEFAULT_CDP_PORT) {
   );
 }
 
-export async function executeInWebView(targetId, expression, port = DEFAULT_CDP_PORT) {
-  const client = await CDP({ target: targetId, port });
-  try {
-    await client.Runtime.enable();
-    const result = await client.Runtime.evaluate({
-      expression,
-      returnByValue: true,
-      awaitPromise: true,
-      timeout: 15000,
-    });
-    return result;
-  } finally {
-    await client.close();
+export async function executeInWebView(targetId, expression, port = DEFAULT_CDP_PORT, maxRetries = 3) {
+  let lastError;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const client = await CDP({ target: targetId, port });
+    try {
+      await client.Runtime.enable();
+      const result = await client.Runtime.evaluate({
+        expression,
+        returnByValue: true,
+        awaitPromise: true,
+        timeout: 15000,
+      });
+      return result;
+    } catch (e) {
+      lastError = e;
+      if (attempt < maxRetries) {
+        await new Promise((r) => setTimeout(r, 1000 * attempt));
+      }
+    } finally {
+      await client.close();
+    }
   }
+  throw lastError;
 }
 
 export async function checkCdpAvailable(port = DEFAULT_CDP_PORT) {
