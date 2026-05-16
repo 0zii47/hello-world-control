@@ -1263,7 +1263,7 @@ server.registerTool(
         const to = m.to?._serialized || m.to || '';
         return from === chatId || to === chatId;
       });
-      chatMsgs.sort((a, b) => (a.t || 0) - (b.t || 0));
+      // Note: sort is done in Node.js after parsing, more reliable
       messages = chatMsgs.map(m => ({
         id: m.id?._serialized || m.id,
         body: m.body || '',
@@ -1324,6 +1324,11 @@ server.registerTool(
         };
       }
 
+      // Sort messages by timestamp (Node.js side, more reliable than in-CDP sort)
+      if (data.messages && Array.isArray(data.messages)) {
+        data.messages.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+      }
+
       // Step 2: Format and write to file (grouped by date)
       const lines = [];
       lines.push(`=== ${data.chatName} (${data.chatId}) 聊天记录 ===`);
@@ -1344,7 +1349,17 @@ server.registerTool(
         }
 
         const sender = m.isFromMe ? "我" : data.chatName;
-        lines.push(`${timeStr}  ${sender}`);
+
+        // Map common WhatsApp message types to Chinese labels
+        const typeLabel = {
+          image: "[图片]", video: "[视频]", sticker: "[贴纸]",
+          ptt: "[语音]", audio: "[语音]", document: "[文件]",
+          revoked: "[已撤回]", gp2: "[群组通知]",
+        }[m.type] || (m.type && m.type !== "text" && m.type !== "chat" ? `[${m.type}]` : "");
+
+        // Build header line: time + sender + optional media label
+        const header = typeLabel ? `${timeStr}  ${sender}  ${typeLabel}` : `${timeStr}  ${sender}`;
+        lines.push(header);
 
         const isBase64Media = m.body && (
           m.body.startsWith("/9j/") || m.body.startsWith("iVBOR") ||
@@ -1353,8 +1368,6 @@ server.registerTool(
         if (m.body && !isBase64Media) {
           lines.push(m.body);
         }
-        if (m.hasMedia) lines.push("[媒体/附件]");
-        if (m.type && m.type !== "text" && m.type !== "chat") lines.push(`[类型: ${m.type}]`);
         lines.push("");
       }
 
