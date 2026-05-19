@@ -24,6 +24,7 @@ export function makeError(message, remediation) {
   const body = { error: message };
   if (remediation) body.remediation = remediation;
   return {
+    isError: true,
     content: [{ type: "text", text: JSON.stringify(body) }],
   };
 }

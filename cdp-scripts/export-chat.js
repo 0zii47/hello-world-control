@@ -1,128 +1,130 @@
 /**
- * 生成导出聊天记录（查找联系人 + 读取消息）的浏览器端 JS 表达式。
+ * 生成导出 WhatsApp 聊天记录的浏览器端 JS 表达式。
+ * 使用 Store.Msg（全局消息存储）获取完整聊天历史，比 chat.msgs 更可靠。
+ *
  * @param {object} opts
- * @param {string} opts.contact_number
- * @returns {string}
+ * @param {string} [opts.contact_number] - 联系人号码，模糊匹配（如 '7608675'）
+ * @param {string} [opts.chat_lid] - WhatsApp LID（如 '153902267777180@lid'），直接搜索最快
+ * @returns {string} 可在 CDP Runtime.evaluate 中执行的表达式
  */
-export function exportChatExpression({ contact_number }) {
-  const num = JSON.stringify(contact_number);
-  return `(async () => {
-  const num = ${num};
+export function exportChatExpression({ contact_number, chat_lid }) {
+  const num = contact_number ? JSON.stringify(contact_number) : null;
+  const lid = chat_lid ? JSON.stringify(chat_lid) : null;
+
+  return `(() => {
+  const _num = ${num};
+  const _lid = ${lid};
+  const TARGETS = [];
+  let chatName = '';
+  let chatId = '';
+
   try {
-    if (typeof Store === 'undefined' || !Store.Contact) {
-      return JSON.stringify({ error: 'WhatsApp Store 尚未加载，请等待几秒后重试。' });
-    }
+    if (!Store || !Store.Msg) return JSON.stringify({ error: 'WhatsApp Store 尚未加载，请等待几秒后重试。' });
 
-    // Step 1: 从 Store.Contact 查找联系人
-    const contacts = Store.Contact.getModelsArray();
-    const match = contacts.find(c => {
-      const id = (c.id?._serialized || c.id || '').replace(/[@c.us@g.us@s.whatsapp.net]/g, '');
-      const clean = id.replace(/[+\\s()-]/g, '');
-      const pn = typeof c.phoneNumber === 'string' ? c.phoneNumber : '';
-      const number = (c.number || c.userid || '').replace(/[@c.us@g.us@s.whatsapp.net]/g, '');
-      return clean.includes(num) || number.includes(num) || pn.includes(num);
-    });
-
-    // Step 2: 从 IndexedDB 获取所有关联 ID（包括 lid 格式）
-    let possibleIds = new Set();
-    let chatName = '';
-
-    try {
-      const idbResult = await new Promise((resolve, reject) => {
-        const request = indexedDB.open('model-storage', 1910);
-        request.onerror = () => resolve(null);
-        request.onsuccess = () => {
-          const db = request.result;
-          try {
-            const tx = db.transaction('contact', 'readonly');
-            const store = tx.objectStore('contact');
-            const getAllReq = store.getAll();
-            getAllReq.onsuccess = () => {
-              const allContacts = getAllReq.result || [];
-              for (const c of allContacts) {
-                const cid = c.id || '';
-                const phoneNum = c.phoneNumber || '';
-                const cnumber = c.number || c.userid || '';
-
-                if (cid.includes(num) || (typeof phoneNum === 'string' && phoneNum.includes(num)) ||
-                    (typeof cnumber === 'string' && cnumber.includes(num))) {
-                  possibleIds.add(cid);
-                  if (typeof phoneNum === 'string' && phoneNum) possibleIds.add(phoneNum);
-                  if (typeof cnumber === 'string' && cnumber) possibleIds.add(cnumber);
-                  if (!chatName) chatName = c.name || c.shortName || c.pushname || '';
-                }
-              }
-              db.close();
-              resolve(true);
-            };
-            getAllReq.onerror = () => { db.close(); resolve(null); };
-          } catch(e) { db.close(); resolve(null); }
-        };
-      });
-    } catch(e) { /* IndexedDB may not be available */ }
-
-    // 也加入 Store.Contact 找到的ID
-    if (match) {
-      possibleIds.add(match.id?._serialized || match.id);
-      if (typeof match.phoneNumber === 'string') possibleIds.add(match.phoneNumber);
-      if (match.number) possibleIds.add(match.number);
-      if (match.userid) possibleIds.add(match.userid);
-      if (!chatName) chatName = match.name || match.formattedName || match.pushname || '';
-    }
-
-    if (possibleIds.size === 0) {
-      return JSON.stringify({ error: '未找到匹配联系人: ' + num });
-    }
-
-    // Step 3: 从 Store.Msg 获取所有相关消息
-    let messages = [];
-    if (Store.Msg) {
-      const allMsgs = Store.Msg.getModelsArray();
-      const chatMsgs = allMsgs.filter(m => {
-        const from = m.from?._serialized || m.from || '';
-        const to = m.to?._serialized || m.to || '';
-        for (const id of possibleIds) {
-          if (from === id || to === id) return true;
-        }
-        return false;
-      });
-      messages = chatMsgs.map(m => ({
-        id: m.id?._serialized || m.id,
-        body: m.body || '',
-        caption: m.caption || '',
-        type: m.type || 'text',
-        from: m.from?._serialized || m.from || '',
-        timestamp: m.t,
-        hasMedia: !!(m.mediaData || m.deprecatedMms3Url || m.mmUrl),
-        isFromMe: !!(m.id?.fromMe || m.fromMe),
-      }));
-    }
-
-    // Fallback: 如果 Store.Msg 没消息，尝试 chat.msgs
-    if (messages.length === 0) {
-      for (const id of possibleIds) {
-        const chat = Store.Chat.get(id);
-        if (chat && chat.msgs) {
-          const msgs = chat.msgs.getModelsArray();
-          if (msgs.length > 0) {
-            messages = msgs.map(m => ({
-              id: m.id?._serialized || m.id,
-              body: m.body || '',
-              type: m.type || 'text',
-              from: m.from?._serialized || m.author || '',
-              timestamp: m.t,
-              hasMedia: !!(m.mediaData || m.deprecatedMms3Url),
-              isFromMe: !!(m.id?.fromMe || m.fromMe),
-            }));
-            break;
+    // Step 1: 确定目标 LID 列表
+    if (_lid) {
+      // 直接使用提供的 LID
+      TARGETS.push(_lid.toLowerCase().replace('@lid','').replace('@c.us',''));
+    } else if (_num) {
+      // 从 Store.Chat 模糊匹配找目标聊天
+      const chats = Store.Chat.getModelsArray();
+      for (const c of chats) {
+        const cname = (c.name || c.formattedTitle || '').toLowerCase();
+        const cid = (c.id?._serialized || c.id || '').toLowerCase();
+        if (cname.includes(_num) || cid.includes(_num)) {
+          const base = cid.replace('@lid','').replace('@c.us','').replace('@g.us','');
+          if (base) {
+            TARGETS.push(base);
+            chatName = chatName || c.name || c.formattedTitle || '';
+            chatId = chatId || (c.id?._serialized || c.id || '');
           }
         }
       }
     }
 
-    return JSON.stringify({ chatName, totalMessages: messages.length, messages });
+    if (TARGETS.length === 0) {
+      return JSON.stringify({ error: _lid ? '未找到 LID 匹配的聊天: ' + _lid : '未找到号码匹配的聊天: ' + _num });
+    }
+
+    // Step 2: 从 Store.Msg 搜索所有相关消息
+    const all = Store.Msg.getModelsArray();
+    const matches = all.filter(m => {
+      const from = (m.from?._serialized || m.from || '').toLowerCase();
+      const to = (m.to?._serialized || m.to || '').toLowerCase();
+      const id = (m.id?._serialized || m.__x_id || '').toLowerCase();
+      for (const t of TARGETS) {
+        if (from.includes(t) || to.includes(t) || id.includes(t)) return true;
+      }
+      return false;
+    });
+
+    let messages = matches.map(m => {
+      const body = m.body || '';
+      const hasMedia = !!(m.mediaData || m.deprecatedMms3Url || m.mmUrl || m.clientUrl ||
+                         (m.type && ['image','video','sticker','ptt','audio','document'].includes(m.type)));
+      return {
+        id: m.id?._serialized || m.__x_id || (m.t + '_' + body.substring(0,20)),
+        body: body,
+        caption: m.caption || '',
+        type: m.type || 'text',
+        timestamp: m.t,
+        hasMedia: hasMedia,
+        isFromMe: !!(m.id?.fromMe || m.fromMe || m.__x_fromMe),
+        from: m.from?._serialized || m.from || '',
+        to: m.to?._serialized || m.to || '',
+        ack: m.ack || 0,
+      };
+    });
+
+    // Fallback: Store.Msg 无结果，尝试 chat.msgs
+    if (messages.length === 0) {
+      for (const t of TARGETS) {
+        for (const suffix of ['@lid', '@c.us', '@g.us']) {
+          const chat = Store.Chat.get(t + suffix);
+          if (chat && chat.msgs && typeof chat.msgs.getModelsArray === 'function') {
+            const msgs = chat.msgs.getModelsArray();
+            if (msgs.length > 0) {
+              messages = msgs.map(m => ({
+                id: m.id?._serialized || m.__x_id || (m.t + '_' + (m.body||'').substring(0,20)),
+                body: m.body || '',
+                caption: m.caption || '',
+                type: m.type || 'text',
+                timestamp: m.t,
+                hasMedia: !!(m.mediaData || m.deprecatedMms3Url || m.mmUrl),
+                isFromMe: !!(m.id?.fromMe || m.fromMe),
+                from: m.from?._serialized || m.from || '',
+                to: m.to?._serialized || m.to || '',
+                ack: m.ack || 0,
+              }));
+              chatName = chatName || chat.name || chat.formattedTitle || '';
+              chatId = chatId || (chat.id?._serialized || chat.id || '');
+              break;
+            }
+          }
+        }
+        if (messages.length > 0) break;
+      }
+    }
+
+    // Step 3: 排序 + 去重
+    messages.sort((a,b) => (a.timestamp||0) - (b.timestamp||0));
+
+    const seen = new Set();
+    const unique = messages.filter(m => {
+      const key = m.id || (m.timestamp + '_' + (m.body||'').substring(0,30));
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    return JSON.stringify({
+      total: unique.length,
+      chatName: chatName,
+      chatId: chatId,
+      messages: unique,
+    });
   } catch(e) {
-    return JSON.stringify({ error: e.message });
+    return JSON.stringify({ error: e.message, stack: e.stack });
   }
 })()`;
 }

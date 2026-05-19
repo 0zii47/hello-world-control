@@ -558,20 +558,47 @@ server.registerTool(
 );
 
 // 16. 导出 WhatsApp 聊天记录到文件
+const CHARACTER_LIMIT = 25000;
+
 server.registerTool(
   "export_whatsapp_chat",
   {
     description:
-      "导出指定 WhatsApp 联系人的全部聊天记录到文件。按联系人号码模糊匹配聊天，读取全部消息，格式化为文本文件保存到桌面。",
-    inputSchema: {
-      contact_number: z
-        .string()
-        .describe("联系人号码，模糊匹配。如 '7608675' 匹配 +1 (570) 760-8675"),
-      output_dir: z.string().optional().describe("输出目录，默认桌面"),
-      port: z.number().optional().default(9222).describe("CDP 调试端口，默认 9222"),
+      "导出指定 WhatsApp 联系人的完整聊天记录到桌面（TXT + JSON 双格式）。\n\n" +
+      "使用 Store.Msg（全局消息存储）获取全部历史消息，比 chat.msgs 更完整可靠。\n\n" +
+      "两种查找方式（二选一）：\n" +
+      "- contact_number: 按号码模糊匹配聊天（如 '7608675' 匹配 +1 (570) 760-8675）\n" +
+      "- chat_lid: 直接按 WhatsApp LID 搜索（如 '153902267777180@lid'，速度最快）\n\n" +
+      "返回：\n" +
+      "- TXT 文件：格式化聊天记录（日期分组、时间戳、发送者标签、媒体类型标签）\n" +
+      "- JSON 文件：完整结构化数据（含消息 ID、类型、时间戳、发送者等）\n" +
+      "- structuredContent: 统计摘要（总数、时间跨度、每日分布、类型分布、收发比例）\n\n" +
+      "使用示例：\n" +
+      "- 按号码导出: contact_number='9013027343'\n" +
+      "- 按 LID 导出: chat_lid='153902267777180@lid'\n" +
+      "- 不知道 LID 时先用 get_whatsapp_chats 获取聊天列表，从中提取 LID",
+    inputSchema: z.object({
+      contact_number: z.string().optional()
+        .describe("联系人号码，模糊匹配。如 '7608675' 匹配 +1 (570) 760-8675。与 chat_lid 二选一"),
+      chat_lid: z.string().optional()
+        .describe("WhatsApp LID，如 '153902267777180@lid'。直接搜索 Store.Msg，速度最快。与 contact_number 二选一"),
+      output_dir: z.string().optional()
+        .describe("输出目录，默认桌面"),
+      port: z.number().int().min(1024).max(65535).optional().default(9222)
+        .describe("CDP 调试端口，默认 9222"),
+    }).strict(),
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
     },
   },
-  async ({ contact_number, output_dir, port }) => {
+  async ({ contact_number, chat_lid, output_dir, port }) => {
+    if (!contact_number && !chat_lid) {
+      return makeError("请提供 contact_number 或 chat_lid 参数。", "先用 get_whatsapp_chats 获取聊天列表。");
+    }
+
     const { target, errorResponse } = await ensureWhatsAppTarget(port);
     if (errorResponse) return errorResponse;
 
@@ -580,7 +607,7 @@ server.registerTool(
       return makeError("输出目录超出允许范围，仅允许桌面及其子目录。");
     }
 
-    const expression = exportChatExpression({ contact_number });
+    const expression = exportChatExpression({ contact_number, chat_lid });
     let data;
     try {
       const result = await executeInWebView(target.id, expression, port);
@@ -597,39 +624,55 @@ server.registerTool(
       return makeError(data.error);
     }
 
-    // Sort messages by timestamp
-    if (data.messages && Array.isArray(data.messages)) {
-      data.messages.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+    const msgs = data.messages || [];
+    if (msgs.length === 0) {
+      return makeResult({ message: "未找到匹配的消息。该聊天可能没有历史记录。" });
     }
 
-    // Format: header line (time + sender) then body + media on same line
+    const total = data.total || msgs.length;
+    const chatName = data.chatName || "未知联系人";
+    const chatId = data.chatId || "";
+    const first = new Date(msgs[0].timestamp * 1000);
+    const last = new Date(msgs[msgs.length - 1].timestamp * 1000);
+
+    // Statistics
+    const daily = {};
+    const typeCounts = {};
+    let fromMe = 0;
+    for (const m of msgs) {
+      const day = new Date(m.timestamp * 1000).toLocaleDateString("zh-CN");
+      daily[day] = (daily[day] || 0) + 1;
+      typeCounts[m.type] = (typeCounts[m.type] || 0) + 1;
+      if (m.isFromMe) fromMe++;
+    }
+
+    // Format TXT
     const lines = [];
-    lines.push(`=== ${data.chatName} (${data.chatId}) 聊天记录 ===`);
+    lines.push(`=== ${chatName} 完整聊天记录 ===`);
     lines.push(`导出时间: ${new Date().toLocaleString("zh-CN")}`);
-    lines.push(`消息总数: ${data.totalMessages}`);
+    lines.push(`消息总数: ${total}`);
+    lines.push(`时间跨度: ${first.toLocaleDateString("zh-CN")} - ${last.toLocaleDateString("zh-CN")}`);
+    lines.push(`账号: Jane-868906`);
     lines.push("");
 
     let lastDate = "";
-    for (const m of data.messages) {
+    for (const m of msgs) {
       const dt = m.timestamp ? new Date(m.timestamp * 1000) : null;
-      const dateStr = dt
-        ? dt.toLocaleDateString("zh-CN", { year: "numeric", month: "long", day: "numeric" })
-        : "未知日期";
-      const timeStr = dt
-        ? dt.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false })
-        : "未知时间";
+      if (!dt) continue;
+      const dateStr = dt.toLocaleDateString("zh-CN", { year: "numeric", month: "long", day: "numeric", weekday: "long" });
+      const timeStr = dt.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
 
       if (dateStr !== lastDate) {
         lastDate = dateStr;
+        lines.push("");
         lines.push(`--- ${dateStr} ---`);
       }
 
-      const sender = m.isFromMe ? "我" : data.chatName;
-
+      const sender = m.isFromMe ? "我" : chatName;
       const typeLabel = {
         image: "[图片]", video: "[视频]", sticker: "[贴纸]",
         ptt: "[语音]", audio: "[语音]", document: "[文件]",
-        revoked: "[已撤回]", gp2: "[群组通知]",
+        revoked: "[已撤回]", gp2: "[群组通知]", album: "[相册]",
       }[m.type] || (m.type && m.type !== "text" && m.type !== "chat" ? `[${m.type}]` : "");
 
       const isBase64Media = m.body && (
@@ -637,10 +680,7 @@ server.registerTool(
         m.body.startsWith("AAAB") || m.body.length > 5000
       );
 
-      // Header: time + sender only
       lines.push(`${timeStr}  ${sender}`);
-
-      // Body + media on same line
       if (m.body && !isBase64Media && typeLabel) {
         lines.push(`${m.body}  ${typeLabel}`);
       } else if (m.body && !isBase64Media) {
@@ -648,28 +688,65 @@ server.registerTool(
       } else if (typeLabel) {
         lines.push(typeLabel);
       }
+      if (m.caption && m.caption !== m.body) {
+        lines.push(`  [说明: ${m.caption}]`);
+      }
       lines.push("");
     }
 
-    const safeName = data.chatName.replace(/[/\\:*?"<>|]/g, "_");
-    const fileName = `${safeName}-聊天记录.txt`;
-    const filePath = join(outputPath, fileName);
-    writeFileSync(filePath, lines.join("\n"), "utf-8");
+    const safeName = chatName.replace(/[/\\:*?"<>|]/g, "_");
+    const txtFileName = `${safeName}-聊天记录.txt`;
+    const jsonFileName = `${safeName}-完整记录.json`;
+    const txtPath = join(outputPath, txtFileName);
+    const jsonPath = join(outputPath, jsonFileName);
 
-    return makeResult({
+    writeFileSync(txtPath, lines.join("\n"), "utf-8");
+    writeFileSync(jsonPath, JSON.stringify({
+      exportTime: new Date().toISOString(),
+      chatName, chatId,
+      account: "Jane-868906",
+      totalMessages: total,
+      firstDate: first.toISOString(),
+      lastDate: last.toISOString(),
+      messages: msgs,
+    }, null, 2), "utf-8");
+
+    // Build structured response with CHARACTER_LIMIT
+    const statsBody = {
       success: true,
-      file_path: filePath,
-      file_name: fileName,
-      chat_id: data.chatId,
-      chat_name: data.chatName,
-      total_messages: data.totalMessages,
-      first_message_time: data.messages.length > 0
-        ? new Date(data.messages[0].timestamp * 1000).toLocaleString("zh-CN")
-        : null,
-      last_message_time: data.messages.length > 0
-        ? new Date(data.messages[data.messages.length - 1].timestamp * 1000).toLocaleString("zh-CN")
-        : null,
-    });
+      txt_path: txtPath,
+      json_path: jsonPath,
+      chat_name: chatName,
+      chat_id: chatId,
+      total_messages: total,
+      time_span: {
+        first: first.toLocaleString("zh-CN"),
+        last: last.toLocaleString("zh-CN"),
+      },
+      daily_distribution: daily,
+      type_distribution: typeCounts,
+      sender_ratio: { from_me: fromMe, from_contact: total - fromMe },
+    };
+
+    let summaryText = [
+      `=== 导出成功: ${chatName} ===`,
+      `TXT: ${txtPath}`,
+      `JSON: ${jsonPath}`,
+      `消息总数: ${total}`,
+      `时间跨度: ${first.toLocaleString("zh-CN")} - ${last.toLocaleString("zh-CN")}`,
+      `收发比例: 我 ${fromMe} 条 / 对方 ${total - fromMe} 条`,
+      `类型: ${Object.entries(typeCounts).map(([k,v]) => `${k}:${v}`).join(", ")}`,
+    ].join("\n");
+
+    if (summaryText.length > CHARACTER_LIMIT) {
+      summaryText = summaryText.substring(0, CHARACTER_LIMIT) +
+        `\n\n[响应已截断（${summaryText.length} 字符）。完整数据请查看导出的文件。]`;
+    }
+
+    return {
+      content: [{ type: "text", text: summaryText }],
+      structuredContent: statsBody,
+    };
   }
 );
 

@@ -22,10 +22,14 @@ bash setup.sh
 - `launch_app_with_debug` — 以 `--remote-debugging-port=9222` 启动 HelloWorld 应用
 
 ### WhatsApp 工具
-- `get_whatsapp_chats` — 所有聊天列表（含最后一条消息预览）
+- `get_whatsapp_chats` — 所有聊天列表（含最后一条消息预览和 LID）
 - `get_whatsapp_messages` — 读取指定聊天的消息
 - `get_whatsapp_contacts` — 搜索/列出联系人
 - `get_whatsapp_unread` — 未读消息汇总
+- `export_whatsapp_chat` — 导出完整聊天记录（TXT + JSON 双格式）
+  - 使用 **Store.Msg** 获取全部历史消息（比 chat.msgs 更完整）
+  - 支持 `contact_number`（号码模糊匹配）或 `chat_lid`（LID 直接搜索）
+  - 返回统计摘要：每日分布、类型分布、收发比例
 
 ## 配置 MCP 客户端
 
